@@ -2,8 +2,17 @@ import math
 import numpy as np
 import cv2
 import os
+
+
+# 相関を求める半径(px)
 template_radius = 35
 
+# すこし大きめに見積もったBB弾の半径(px)
+bb_radius = 50
+
+# BB弾検出の閾値(DN)
+min_gray = 45
+max_gray = 255
 
 def crop(img, pt, size):
     """
@@ -57,7 +66,7 @@ def rot(img, rot_in_deg):
     mat = cv2.getRotationMatrix2D(center, rot_in_deg, 1)
     return cv2.warpAffine(img, mat, (w,h), borderValue=bg)
 
-def inner_circle(src, pt, size = 50):
+def inner_circle(src, pt, size = bb_radius):
     """
     領域の内接円中心を求める
 
@@ -68,7 +77,7 @@ def inner_circle(src, pt, size = 50):
     pt : [number,number]
         抽出する円のおおよその位置[col,row]
     size : int
-        抽出する円を内包する直径
+        抽出する円を内包する直径(px)
 
     Returns
     -------
@@ -77,8 +86,6 @@ def inner_circle(src, pt, size = 50):
     c = crop(src, pt, (size * 2, size * 2))
     c = cv2.bitwise_not(c)
     contours, hierarchy=cv2.findContours(c,cv2.RETR_LIST,cv2.CHAIN_APPROX_NONE)
-    #filter out the contours that doesn't have the correct area size and draw the into original image
-    #loop through the contours with certain conditions
     cv2.imshow('inner src', c)
     #cv2.waitKey(0)  
     for i in range(len(contours)):
@@ -104,7 +111,7 @@ def estimate_rot(src, template, pt):
     template : mat
         テンプレート画像
     pt : [number,number]
-        推定対象の中心位置
+        推定対象の中心位置[col,row]
     Returns
     -------
     回転角 -180~+180(deg)
@@ -114,8 +121,9 @@ def estimate_rot(src, template, pt):
     c = crop(src, pt, (template.shape[0], template.shape[1]))
     s = mask_circle(c, template_radius)
     cv2.imshow("match src", s)
+    # ぐるぐる回しながら相関が最大となる角度を求める
     for i in range(-1800, 1800):
-        t = rot(template, i / 10)
+        t = rot(template, i / 10.0)
         cv2.imshow("template", t)
         #cv2.waitKey(1)
         match_result = cv2.matchTemplate(s, t, cv2.TM_CCOEFF)
@@ -129,6 +137,20 @@ def estimate_rot(src, template, pt):
     return angle
 
 def mask_circle(src, radius):
+    """
+    円の外側を白で塗りつぶす。
+
+    Parameters
+    ----------
+    src : mat
+        塗りつぶし対象の画像
+
+    radius : int
+        円の半径(px)
+    Returns
+    -------
+    塗りつぶした画像
+    """
     mask = np.zeros(src.shape, np.uint8)
     center = (int(mask.shape[0]/2), int(mask.shape[1]/2))
     cv2.circle(mask, center, radius, 1, -1)
@@ -138,24 +160,45 @@ def mask_circle(src, radius):
     return ret + bg
 
 def process(filename):
+    """
+    写っているすべてのBB弾の角度を推定
+
+    Parameters
+    ----------
+    filename : string
+        画像ファイル名
+
+    Returns
+    -------
+    結果をオーバーレイした画像
+    """
+
+
     src = cv2.imread(filename, 0)
-    src = cv2.flip(src, 1)
+    # 右から撃った場合はコメントアウトして左から右へ時系列になるように反転
+    # src = cv2.flip(src, 1)
+
+    # 画像のコントラスト調整
     scaled = cv2.convertScaleAbs(src, alpha= 3, beta = 0)
+    # ノイズ除去
+    # この辺りは撮影データの品質依存…
     median = cv2.medianBlur(src, ksize=11)
     cv2.imshow('median', median)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (70, 70))
     opening = cv2.morphologyEx(median, cv2.MORPH_OPEN, kernel, iterations=1)
     cv2.imshow('opeing', opening)
-    ret, threshold = cv2.threshold(opening, 45, 255, cv2.THRESH_BINARY_INV)
+    # 2値化してブロブ検出用の画像を作成
+    ret, threshold = cv2.threshold(opening, min_gray, max_gray, cv2.THRESH_BINARY_INV)
     cv2.imshow('threshold', threshold)
     bsrc = threshold
 
     # Setup SimpleBlobDetector parameters.
     params = cv2.SimpleBlobDetector_Params()
     # Filter by Area.
+    
     params.filterByArea = True
-    params.minArea = 50 * 50 * math.pi / 4
-    params.maxArea = 50 * 50 * math.pi
+    params.minArea = bb_radius * bb_radius * math.pi / 4
+    params.maxArea = bb_radius * bb_radius * math.pi
 
     # Filter by Circularity
     params.filterByCircularity = True
@@ -183,35 +226,56 @@ def process(filename):
 
     # 列でソート
     kps = sorted(keypoints, key=lambda kp: kp.pt[0])
-    template_index = 5
+
+    # 左から数えてtemplate_index目のBB弾を基準とする
+    template_index = 0
+
+    # 基準としたBB弾を切り出してテンプレートとする
     c = crop(scaled, kps[template_index].pt, (kps[template_index].size + 10, kps[template_index].size + 10))
+
+    # テンプレートの外周部をマスクする
+    # BB弾の境界付近は相関が取りにくく結果が安定しないので多少削ってしまう
     template = mask_circle(c, 40)
     cv2.imshow("template", template);
+
+    # 検出したBB弾すべてに角度推定を実行する
     result = []
     for k in kps:
+        # ブロブの内接円中心を求める
         point = inner_circle(bsrc, k.pt)
+
+        #　角度を推定
         angle = estimate_rot(scaled, template, point)
+
+        # 推定角度がわかるように線分表示
         r = math.radians(angle)
         d = (math.sin(r) * 50,math.cos(r) * 50)
         pt1 = np.add(point, d).astype(np.int32)
         pt2 = np.subtract(point, d).astype(np.int32)
         cv2.line(blobs, pt1, pt2, (0,0,255), 1)
-        if(point[0] > 2500 and angle < 0):
-            angle = angle + 180
-        result.append((filename, point[0], 4000 - point[1], angle))
-    # 画像を表示
+
+        #半回転以上する場合、計算が面倒なので補正
+        #if(point[0] > 2500 and angle < 0):
+        #    angle = angle + 180
+        result.append((filename, point[0], point[1], angle))
+
+    # 板にぶつかったコマを検出(板衝突検証用)
     min_index = result.index(min(result, key = lambda k: k[2]))
 
+    # 結果の表示など
     for i, d in enumerate(result):
         print(*d, (i - min_index) * 0.1, sep = ',')
     cv2.imshow("blobs", blobs) 
-    #cv2.waitKey(0) 
+    cv2.waitKey(0) 
     return blobs
 
-root = './bbrot'
-files = os.listdir(path=root)
-i = 1
-for f in files:
-    res = process(os.path.join(root, f))
-    cv2.imwrite(str(i) + ".jpg", res)
-    i += 1
+res = process("sample.jpg")
+cv2.imwrite("result.jpg", res)
+#指定したフォルダの画像すべてに対して実行
+# root = './bbrot'
+# files = os.listdir(path=root)
+# i = 1
+# for f in files:
+#     res = process(os.path.join(root, f))
+#     cv2.imwrite(str(i) + ".jpg", res)
+#     i += 1
